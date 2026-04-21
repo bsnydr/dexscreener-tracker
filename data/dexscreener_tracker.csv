@@ -1,1 +1,6 @@
 first_seen,last_seen,chain,ca,symbol,name,liquidity_usd,market_cap,volume_24h,price_usd,dex_url
+2026-04-21 19:16:36 UTC,2026-04-21 19:16:36 UTC,ethereum,0xD09185Df1d4B966Ac559FA72cE5E6ADf5DC5Ffe3,CLUTCH,Clutch The Bald Eagle,40583.06,418487,328311.76,0.0004184,https://dexscreener.com/ethereum/0xb49e10f4ff4c258d790752cd7b1fefa733f5c170
+2026-04-21 19:16:36 UTC,2026-04-21 19:16:36 UTC,solana,BUVSTjCb9F17HF5mmBBjHbLau92r9LGNRGPKDxj6brrr,1,Just stake $1 of this coin,41373.02,172138,220617.5,0.0001799,https://dexscreener.com/solana/2moaq4qmmb3esv4jzvr7ysykggtr3amga839u3byokhh
+2026-04-21 19:16:36 UTC,2026-04-21 19:16:36 UTC,ethereum,0x01328FaFFA6CF98988F0530A57538a896B65A37e,SNOOPY,Snoopy,40384.14,199867,202335.21,0.0001998,https://dexscreener.com/ethereum/0xefd08a28814dbd189cc50a3c57c66be7a6ff4c9c
+2026-04-21 19:16:36 UTC,2026-04-21 19:16:36 UTC,solana,BVG5pTybt2EV2LzfDoKLPmH8QVRoq5XPbdBUAy2rtCdb,LENS,ChainLens,33960.61,141157,178944.04,0.0001411,https://dexscreener.com/solana/2h9zdxw2yh3dxq1iomqto59pycycohpxjteczjkhggwr
+2026-04-21 19:16:36 UTC,2026-04-21 19:16:36 UTC,solana,GgdyqHFjU2o91NhyDn3P3aqxnHgjnBWBRJJiJgXGbrrr,UN,Unobtainium,25521.85,120689,121063.82,0.0001234,https://dexscreener.com/solana/eeuytymkvozrdghmj36gwrs6rtsgd92wa1ataafp8tsq
