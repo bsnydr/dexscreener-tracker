@@ -62,8 +62,21 @@ def log(msg):
 
 # ---------- http ----------
 
+# browser-like UA - DexScreener 403s default python-urllib user-agents
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
 def http_get(url):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": BROWSER_UA,
+        },
+    )
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -82,12 +95,21 @@ def http_post_json(url, payload):
 
 def fetch_profiles():
     log("fetching token profiles")
-    try:
-        data = http_get(f"{API_BASE}/token-profiles/latest/v1")
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        log(f"error fetching profiles: {e}")
-        return []
+    for attempt in range(1, 3):
+        try:
+            data = http_get(f"{API_BASE}/token-profiles/latest/v1")
+            return data if isinstance(data, list) else []
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and attempt == 1:
+                log(f"403 on profiles, retrying in 3s")
+                time.sleep(3)
+                continue
+            log(f"error fetching profiles: {e}")
+            return []
+        except Exception as e:
+            log(f"error fetching profiles: {e}")
+            return []
+    return []
 
 def fetch_pair_data(chain, address):
     try:
