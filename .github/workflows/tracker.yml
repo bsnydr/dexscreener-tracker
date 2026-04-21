@@ -1,1 +1,42 @@
+name: dexscreener-tracker
 
+on:
+  schedule:
+    # every 6 hours at minute 0 (UTC): 00:00, 06:00, 12:00, 18:00
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # allows manual "Run workflow" button
+
+permissions:
+  contents: write  # needed to commit the updated CSV back to the repo
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run tracker
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+        run: python dexscreener_tracker.py
+
+      - name: Commit CSV if changed
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain data/)" ]; then
+            git add data/
+            git commit -m "tracker: update CSV $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          else
+            echo "No CSV changes to commit"
+          fi
