@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-DexScreener tracker - v3 (multi-endpoint fan-out + filtering)
+DexScreener tracker - v4 (template matching + ATH tracking + vol baseline)
 
-Fans out across multiple DexScreener feeders (search by chain, latest
-profiles, latest boosts, top boosts), dedupes, enriches each candidate
-with /latest/dex/tokens/{address} for full liquidity/mcap/volume data,
-applies the user's filter thresholds, then POSTs new rows to the
-Apps Script ingest endpoint.
+What's new vs v3:
+  - Loads templates.json from repo
+  - Captures vol_at_ingest, price_at_ingest, change_h1/h6/h24, age at ingest
+  - Evaluates template rules, picks A/B/C or fallback
+  - POSTs richer payload to Apps Script (chain, ca, vol_at_ingest, price_at_ingest, template, template_flag)
 
 Filters (matching DexScreener website screener):
   - Chains: Solana, Ethereum, BSC, Base
@@ -32,21 +32,18 @@ from datetime import datetime, timezone
 API_BASE = "https://api.dexscreener.com"
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
 CSV_PATH = "data/dexscreener_tracker.csv"
+TEMPLATES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "templates.json")
 REQUEST_TIMEOUT = 30
 
-# Filter thresholds (match the screener UI)
 TARGET_CHAINS = {"solana", "ethereum", "bsc", "base"}
 MIN_LIQUIDITY_USD = 25_000
 MIN_MARKET_CAP = 100_000
 MAX_MARKET_CAP = 15_000_000
 MIN_VOLUME_24H = 100_000
 
-# Polite pacing - DexScreener rate limits are 60/min for profile/boost
-# endpoints and 300/min for search/tokens. Sleep between calls to stay safe.
-SLEEP_BETWEEN_CALLS = 0.5  # seconds
+SLEEP_BETWEEN_CALLS = 0.5
 SLEEP_BETWEEN_ENRICH = 0.25
 
-# DexScreener 403s default Python user-agents from cloud IPs
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -66,17 +63,13 @@ def log(msg):
 def http_get(url):
     req = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": BROWSER_UA,
-        },
+        headers={"Accept": "application/json", "User-Agent": BROWSER_UA},
     )
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def safe_get(url, label):
-    """GET with one retry on 403/429."""
     for attempt in (1, 2):
         try:
             return http_get(url)
@@ -91,6 +84,84 @@ def safe_get(url, label):
             log(f"  {label}: {type(e).__name__} {e}")
             return None
     return None
+
+
+# ---------- TEMPLATES ----------
+
+def load_templates():
+    try:
+        with open(TEMPLATES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"WARNING: failed to load {TEMPLATES_PATH}: {e}")
+        return None
+
+
+def evaluate_rules(token_data, templates_config):
+    """
+    Apply template rules to token data.
+    Returns dict {template: 'A'|'B'|'C', flag: '' or 'FALLBACK_NO_MATCH'}.
+    """
+    if not templates_config:
+        return {"template": "A", "flag": "NO_TEMPLATES_CONFIG"}
+
+    for rule in templates_config.get("rules", []):
+        if rule_matches(rule.get("conditions", {}), token_data):
+            return {"template": rule["template"], "flag": ""}
+
+    fallback = templates_config.get("fallback", {})
+    return {
+        "template": fallback.get("template", "A"),
+        "flag": fallback.get("flag", "FALLBACK_NO_MATCH"),
+    }
+
+
+def rule_matches(conditions, td):
+    age = td.get("age_days")
+    mcap = td.get("market_cap") or 0
+    vol = td.get("volume_24h") or 0
+    vol_ingest = td.get("vol_at_ingest") or 0
+    price = td.get("price") or 0
+    price_max = td.get("price_max_seen") or price
+    ch_h1 = td.get("change_h1")
+    ch_h6 = td.get("change_h6")
+    ch_h24 = td.get("change_h24")
+
+    if "min_age_days" in conditions:
+        if age is None or age < conditions["min_age_days"]:
+            return False
+    if "max_age_days" in conditions:
+        if age is None or age >= conditions["max_age_days"]:
+            return False
+
+    if "min_market_cap" in conditions and mcap < conditions["min_market_cap"]:
+        return False
+
+    if "min_vol_ratio_vs_ingest" in conditions:
+        if vol_ingest <= 0:
+            return False
+        ratio = vol / vol_ingest
+        if ratio < conditions["min_vol_ratio_vs_ingest"]:
+            return False
+
+    if "min_drawdown_from_max_pct" in conditions:
+        if price_max <= 0:
+            return False
+        drawdown = ((price_max - price) / price_max) * 100
+        if drawdown < conditions["min_drawdown_from_max_pct"]:
+            return False
+
+    if "min_change_h1_pct" in conditions:
+        if ch_h1 is None or ch_h1 < conditions["min_change_h1_pct"]:
+            return False
+    if "min_change_h6_pct" in conditions:
+        if ch_h6 is None or ch_h6 < conditions["min_change_h6_pct"]:
+            return False
+    if "min_change_h24_pct" in conditions:
+        if ch_h24 is None or ch_h24 < conditions["min_change_h24_pct"]:
+            return False
+
+    return True
 
 
 # ---------- FEEDERS ----------
@@ -144,11 +215,6 @@ def feeder_search(query):
 # ---------- ENRICHMENT + FILTER ----------
 
 def enrich_and_filter(candidate):
-    """
-    Fetch full pair data for one candidate. Returns dict if it passes
-    filters, None otherwise. Picks the highest-liquidity pair for the
-    token (mirrors what the website does).
-    """
     chain = candidate["chainId"]
     addr = candidate["tokenAddress"]
 
@@ -164,12 +230,10 @@ def enrich_and_filter(candidate):
     if not pairs:
         return None
 
-    # Filter to pairs on the candidate's chain (a token can exist on multiple)
     pairs = [p for p in pairs if (p.get("chainId") or "").lower() == chain]
     if not pairs:
         return None
 
-    # Pick the most liquid pair
     pairs.sort(
         key=lambda p: ((p.get("liquidity") or {}).get("usd") or 0),
         reverse=True,
@@ -180,13 +244,21 @@ def enrich_and_filter(candidate):
     mcap = best.get("marketCap") or best.get("fdv") or 0
     vol24 = (best.get("volume") or {}).get("h24") or 0
 
-    # Apply filters
     if liq < MIN_LIQUIDITY_USD:
         return None
     if mcap < MIN_MARKET_CAP or mcap > MAX_MARKET_CAP:
         return None
     if vol24 < MIN_VOLUME_24H:
         return None
+
+    price_usd = float(best.get("priceUsd") or 0)
+    change = best.get("priceChange") or {}
+    pair_created_ms = best.get("pairCreatedAt") or 0
+
+    age_days = None
+    if pair_created_ms > 0:
+        age_ms = (datetime.now(timezone.utc).timestamp() * 1000) - pair_created_ms
+        age_days = int(age_ms / (1000 * 60 * 60 * 24))
 
     return {
         "chain": chain,
@@ -196,13 +268,17 @@ def enrich_and_filter(candidate):
         "liquidity_usd": liq,
         "market_cap": mcap,
         "volume_24h": vol24,
+        "price": price_usd,
+        "change_h1": change.get("h1"),
+        "change_h6": change.get("h6"),
+        "change_h24": change.get("h24"),
+        "age_days": age_days,
     }
 
 
 # ---------- CSV ----------
 
 def load_existing_csv():
-    """Returns set of seen (chain, ca_lower) tuples."""
     seen = set()
     if not os.path.exists(CSV_PATH):
         return seen
@@ -223,6 +299,8 @@ def append_to_csv(rows):
         fieldnames = [
             "first_seen_utc", "chain", "ca", "symbol", "name",
             "liquidity_usd", "market_cap", "volume_24h",
+            "vol_at_ingest", "price_at_ingest", "age_days_at_ingest",
+            "template", "template_flag",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -238,6 +316,11 @@ def append_to_csv(rows):
                 "liquidity_usd": int(r["liquidity_usd"]),
                 "market_cap": int(r["market_cap"]),
                 "volume_24h": int(r["volume_24h"]),
+                "vol_at_ingest": int(r["volume_24h"]),
+                "price_at_ingest": r.get("price") or 0,
+                "age_days_at_ingest": r.get("age_days") if r.get("age_days") is not None else "",
+                "template": r.get("template", ""),
+                "template_flag": r.get("template_flag", ""),
             })
 
 
@@ -251,17 +334,22 @@ def push_to_apps_script(rows):
         log("no new rows to push")
         return
 
-    # Map chain to display format the script expects
     chain_display = {
         "solana": "Solana",
         "ethereum": "Ethereum",
         "bsc": "BSC",
         "base": "Base",
     }
-    payload_rows = [
-        {"chain": chain_display.get(r["chain"], r["chain"]), "ca": r["ca"]}
-        for r in rows
-    ]
+    payload_rows = []
+    for r in rows:
+        payload_rows.append({
+            "chain": chain_display.get(r["chain"], r["chain"]),
+            "ca": r["ca"],
+            "vol_at_ingest": int(r["volume_24h"]),
+            "price_at_ingest": r.get("price") or 0,
+            "template": r.get("template", ""),
+            "template_flag": r.get("template_flag", ""),
+        })
     payload = {"source": "dexscreener_tracker", "rows": payload_rows}
 
     try:
@@ -282,9 +370,14 @@ def push_to_apps_script(rows):
 
 def main():
     t0 = time.time()
-    log("starting dexscreener tracker v3")
+    log("starting dexscreener tracker v4")
 
-    # Step 1: fan out across feeders
+    templates_config = load_templates()
+    if templates_config:
+        log(f"loaded {len(templates_config.get('rules', []))} rules from {TEMPLATES_PATH}")
+    else:
+        log("WARNING: no templates loaded, all rows will get fallback")
+
     candidates = []
     candidates += feeder_token_profiles()
     time.sleep(SLEEP_BETWEEN_CALLS)
@@ -296,7 +389,6 @@ def main():
         candidates += feeder_search(chain)
         time.sleep(SLEEP_BETWEEN_CALLS)
 
-    # Step 2: dedupe and filter to target chains BEFORE expensive enrichment
     seen_keys = set()
     unique = []
     for c in candidates:
@@ -311,32 +403,50 @@ def main():
         unique.append(c)
     log(f"after dedupe + chain filter: {len(unique)} unique candidates")
 
-    # Step 3: drop ones already in our CSV - no need to re-enrich them
     existing = load_existing_csv()
     fresh = [c for c in unique if (c["chainId"], c["tokenAddress"].lower()) not in existing]
     log(f"after CSV dedupe: {len(fresh)} fresh candidates ({len(unique) - len(fresh)} already tracked)")
 
-    # Step 4: enrich each fresh candidate, apply numeric filters
     log(f"enriching {len(fresh)} candidates...")
     passed = []
+    template_counts = {"A": 0, "B": 0, "C": 0, "FALLBACK": 0}
+
     for i, c in enumerate(fresh, 1):
         result = enrich_and_filter(c)
-        if result:
-            passed.append(result)
-            log(f"  [{i}/{len(fresh)}] PASS {result['chain']} {result['symbol']:<12} "
-                f"liq=${int(result['liquidity_usd']):>10,} "
-                f"mcap=${int(result['market_cap']):>11,} "
-                f"vol=${int(result['volume_24h']):>11,}")
+        if not result:
+            time.sleep(SLEEP_BETWEEN_ENRICH)
+            continue
+
+        td_for_rules = dict(result)
+        td_for_rules["vol_at_ingest"] = result["volume_24h"]
+        td_for_rules["price_max_seen"] = result["price"]
+
+        decision = evaluate_rules(td_for_rules, templates_config)
+        result["template"] = decision["template"]
+        result["template_flag"] = decision["flag"]
+
+        if decision["flag"]:
+            template_counts["FALLBACK"] += 1
+        else:
+            template_counts[decision["template"]] += 1
+
+        passed.append(result)
+        flag_str = f" [{decision['flag']}]" if decision["flag"] else ""
+        log(f"  [{i}/{len(fresh)}] PASS {result['chain']} {result['symbol']:<12} "
+            f"liq=${int(result['liquidity_usd']):>10,} "
+            f"mcap=${int(result['market_cap']):>11,} "
+            f"vol=${int(result['volume_24h']):>11,} "
+            f"-> {decision['template']}{flag_str}")
         time.sleep(SLEEP_BETWEEN_ENRICH)
 
     log(f"{len(passed)} candidates passed filters")
+    log(f"templates: A={template_counts['A']} B={template_counts['B']} "
+        f"C={template_counts['C']} fallback={template_counts['FALLBACK']}")
 
-    # Step 5: write to CSV
     if passed:
         append_to_csv(passed)
         log(f"appended {len(passed)} rows to {CSV_PATH}")
 
-    # Step 6: push to Apps Script
     push_to_apps_script(passed)
 
     elapsed = time.time() - t0

@@ -86,7 +86,11 @@ var COL = {
   VOLUME_24H: 18,
   CHANGE_24H: 19,
   AGE: 20,
-  LAST_AUTO_ENRICH: 21
+  LAST_AUTO_ENRICH: 21,
+  VOL_AT_INGEST: 22,
+  PRICE_MAX_SEEN: 23,
+  TEMPLATE: 24,
+  ROW_WIDTH: 24
 };
 
 var DUPE_COLS = [COL.ADDRESS, COL.X_PROFILE, COL.TG, COL.X_COMMUNITY];
@@ -131,6 +135,10 @@ function onOpen() {
     .addItem('Run Diagnostic', 'runDiagnostic')
     .addItem('Force Refresh (sort + colors)', 'forceRefresh')
     .addItem('Debug Current Row', 'debugCurrentRow')
+    .addSeparator()
+    .addItem('Setup Template Columns (V/W/X)', 'setupTemplateColumns')
+    .addItem('Refresh Templates from GitHub', 'refreshTemplatesNow')
+    .addItem('Re-decide Templates (all rows)', 'redecideAllTemplates')
     .addToUi();
 }
 
@@ -439,10 +447,10 @@ function enrichRows_(sheet, startRow, endRow, silent, mode, opts) {
   if (lastRow < startRow) return;
 
   var numRows = lastRow - startRow + 1;
-  var numCols = Math.max(sheet.getLastColumn(), COL.LAST_AUTO_ENRICH);
+  var numCols = Math.max(sheet.getLastColumn(), COL.ROW_WIDTH);
   var values = sheet.getRange(startRow, 1, numRows, numCols).getValues();
 
-  ensureRowsWideEnough_(values, COL.LAST_AUTO_ENRICH);
+  ensureRowsWideEnough_(values, COL.ROW_WIDTH);
 
   var apiKey = getBirdeyeApiKey_();
   var targets = buildTargetList_(values, startRow, mode || PROCESS_MODE.NORMAL);
@@ -482,7 +490,7 @@ function enrichRows_(sheet, startRow, endRow, silent, mode, opts) {
     }
 
     var liveRow = sheet.getRange(liveRowNumber, 1, 1, numCols).getValues()[0];
-    ensureRowsWideEnough_([liveRow], COL.LAST_AUTO_ENRICH);
+    ensureRowsWideEnough_([liveRow], COL.ROW_WIDTH);
 
     var ctx = buildRowContext_(liveRow);
 
@@ -500,12 +508,18 @@ function enrichRows_(sheet, startRow, endRow, silent, mode, opts) {
 
     writeContextToRow_(ctx, liveRow);
 
+    try {
+      redecideTemplateForRow_(ctx, liveRow, log);
+    } catch (tplErr) {
+      log.push('  [TPL] ERROR: ' + tplErr.message);
+    }
+
     if (mode === PROCESS_MODE.AUTO || mode === PROCESS_MODE.PENDING) {
       liveRow[idx_(COL.LAST_AUTO_ENRICH)] = new Date();
     }
 
-    sheet.getRange(liveRowNumber, 1, 1, COL.LAST_AUTO_ENRICH)
-      .setValues([liveRow.slice(0, COL.LAST_AUTO_ENRICH)]);
+    sheet.getRange(liveRowNumber, 1, 1, COL.ROW_WIDTH)
+      .setValues([liveRow.slice(0, COL.ROW_WIDTH)]);
 
     logRowSummary_(ctx, log);
 
@@ -1457,7 +1471,7 @@ function runDiagnostic() {
     return;
   }
 
-  var numCols = Math.max(sheet.getLastColumn(), COL.LAST_AUTO_ENRICH);
+  var numCols = Math.max(sheet.getLastColumn(), COL.ROW_WIDTH);
   var values = sheet.getRange(CONFIG.DATA_START_ROW, 1, dataRows, numCols).getValues();
 
   var counts = {
@@ -1695,6 +1709,9 @@ function fetchDexScreenerToken_(address) {
     var marketCap = best.marketCap || (best.fdv || null);
     var volume24h = (best.volume && best.volume.h24) || null;
     var priceChange24h = (best.priceChange && best.priceChange.h24) || null;
+    var priceChange_h6 = (best.priceChange && best.priceChange.h6);
+    var priceChange_h1 = (best.priceChange && best.priceChange.h1);
+    var priceUsd = best.priceUsd ? Number(best.priceUsd) : null;
 
     return {
       chain: best.chainId || '',
@@ -1705,7 +1722,10 @@ function fetchDexScreenerToken_(address) {
       pairCreatedAt: best.pairCreatedAt || null,
       marketCap: marketCap,
       volume24h: volume24h,
-      priceChange24h: priceChange24h
+      priceChange24h: priceChange24h,
+      price: priceUsd,
+      change_h1: (priceChange_h1 == null) ? null : Number(priceChange_h1),
+      change_h6: (priceChange_h6 == null) ? null : Number(priceChange_h6)
     };
   } catch (err) {
     Logger.log('DS error: ' + err.message);
@@ -2214,7 +2234,14 @@ function doPost(e) {
       }
       seenInBatch[caKey] = true;
 
-      toInsert.push(_buildSheetRow_(ca, chain));
+      toInsert.push(_buildSheetRow_(
+        ca,
+        chain,
+        Number(row.vol_at_ingest) || 0,
+        Number(row.price_at_ingest) || 0,
+        normalize_(row.template),
+        normalize_(row.template_flag)
+      ));
     }
 
     if (toInsert.length === 0) {
@@ -2227,7 +2254,7 @@ function doPost(e) {
     var insertAtRow = CONFIG.DATA_START_ROW;
     sheet.insertRowsBefore(insertAtRow, toInsert.length);
 
-    var numCols = Math.max(sheet.getLastColumn(), COL.LAST_AUTO_ENRICH);
+    var numCols = Math.max(sheet.getLastColumn(), COL.ROW_WIDTH);
     var padded = toInsert.map(function(r) {
       while (r.length < numCols) r.push('');
       return r;
@@ -2294,9 +2321,9 @@ function _getExistingAddresses_(sheet) {
   return set;
 }
 
-function _buildSheetRow_(ca, chain) {
+function _buildSheetRow_(ca, chain, volAtIngest, priceAtIngest, template, templateFlag) {
   var row = [];
-  for (var c = 0; c < COL.LAST_AUTO_ENRICH; c++) row.push('');
+  for (var c = 0; c < COL.ROW_WIDTH; c++) row.push('');
 
   row[idx_(COL.ADDRESS)] = ca;
   row[idx_(COL.CHAIN)] = chain;
@@ -2308,6 +2335,12 @@ function _buildSheetRow_(ca, chain) {
   var chainLower = chain.toLowerCase();
   if (chainLower && chainLower !== 'evm') {
     row[idx_(COL.DS)] = buildDexScreenerUrl_(chainLower, ca);
+  }
+
+  if (volAtIngest && volAtIngest > 0) row[idx_(COL.VOL_AT_INGEST)] = volAtIngest;
+  if (priceAtIngest && priceAtIngest > 0) row[idx_(COL.PRICE_MAX_SEEN)] = priceAtIngest;
+  if (template) {
+    row[idx_(COL.TEMPLATE)] = template + (templateFlag ? ' [' + templateFlag + ']' : '');
   }
 
   return row;
@@ -2597,4 +2630,269 @@ function _diagFindRecentByChain(chainFilter) {
     if (chain === chainFilter) return { address: addr, chain: chain };
   }
   return null;
+}
+
+// =============================================================================
+// TEMPLATE ENGINE
+// Rule evaluation mirrors dexscreener-tracker/dexscreener_tracker.py.
+// templates.json lives at repo root and is fetched from raw GitHub, cached 1h.
+// =============================================================================
+
+var TEMPLATES_URL = 'https://raw.githubusercontent.com/bsnydr/dexscreener-tracker/main/templates.json';
+var TEMPLATES_CACHE_PROP = 'TEMPLATES_CACHE';
+var TEMPLATES_CACHE_TS_PROP = 'TEMPLATES_CACHE_TS';
+var TEMPLATES_CACHE_TTL_MS = 60 * 60 * 1000;
+
+function fetchTemplatesConfig_() {
+  var props = PropertiesService.getScriptProperties();
+  var cached = props.getProperty(TEMPLATES_CACHE_PROP);
+  var cachedTs = Number(props.getProperty(TEMPLATES_CACHE_TS_PROP) || 0);
+
+  if (cached && (Date.now() - cachedTs) < TEMPLATES_CACHE_TTL_MS) {
+    try { return JSON.parse(cached); } catch (e) { /* fall through */ }
+  }
+
+  try {
+    var resp = UrlFetchApp.fetch(TEMPLATES_URL, {
+      muteHttpExceptions: true,
+      headers: { 'Accept': 'application/json' }
+    });
+    if (resp.getResponseCode() !== 200) {
+      Logger.log('templates fetch failed: HTTP ' + resp.getResponseCode());
+      return cached ? JSON.parse(cached) : null;
+    }
+    var body = resp.getContentText();
+    var parsed = JSON.parse(body);
+    props.setProperty(TEMPLATES_CACHE_PROP, body);
+    props.setProperty(TEMPLATES_CACHE_TS_PROP, String(Date.now()));
+    return parsed;
+  } catch (err) {
+    Logger.log('templates fetch error: ' + err.message);
+    return cached ? JSON.parse(cached) : null;
+  }
+}
+
+function refreshTemplatesNow() {
+  PropertiesService.getScriptProperties().deleteProperty(TEMPLATES_CACHE_TS_PROP);
+  var cfg = fetchTemplatesConfig_();
+  if (cfg) {
+    SpreadsheetApp.getUi().alert(
+      'Templates refreshed.\n\n' +
+      'Templates: ' + Object.keys(cfg.templates || {}).join(', ') + '\n' +
+      'Rules: ' + (cfg.rules || []).length
+    );
+  } else {
+    SpreadsheetApp.getUi().alert('Failed to fetch templates. Check Logger for details.');
+  }
+}
+
+function evaluateTemplateRules_(td, cfg) {
+  if (!cfg) return { template: 'A', flag: 'NO_TEMPLATES_CONFIG' };
+  var rules = cfg.rules || [];
+  for (var i = 0; i < rules.length; i++) {
+    if (ruleMatches_(rules[i].conditions || {}, td)) {
+      return { template: rules[i].template, flag: '' };
+    }
+  }
+  var fb = cfg.fallback || {};
+  return { template: fb.template || 'A', flag: fb.flag || 'FALLBACK_NO_MATCH' };
+}
+
+function ruleMatches_(conditions, td) {
+  var age = td.age_days;
+  var mcap = Number(td.market_cap) || 0;
+  var vol = Number(td.volume_24h) || 0;
+  var volIngest = Number(td.vol_at_ingest) || 0;
+  var price = Number(td.price) || 0;
+  var priceMax = Number(td.price_max_seen) || price;
+  var chH1 = td.change_h1;
+  var chH6 = td.change_h6;
+  var chH24 = td.change_h24;
+
+  if ('min_age_days' in conditions) {
+    if (age == null || age < conditions.min_age_days) return false;
+  }
+  if ('max_age_days' in conditions) {
+    if (age == null || age >= conditions.max_age_days) return false;
+  }
+  if ('min_market_cap' in conditions && mcap < conditions.min_market_cap) return false;
+
+  if ('min_vol_ratio_vs_ingest' in conditions) {
+    if (volIngest <= 0) return false;
+    if ((vol / volIngest) < conditions.min_vol_ratio_vs_ingest) return false;
+  }
+
+  if ('min_drawdown_from_max_pct' in conditions) {
+    if (priceMax <= 0) return false;
+    var drawdown = ((priceMax - price) / priceMax) * 100;
+    if (drawdown < conditions.min_drawdown_from_max_pct) return false;
+  }
+
+  if ('min_change_h1_pct' in conditions) {
+    if (chH1 == null || Number(chH1) < conditions.min_change_h1_pct) return false;
+  }
+  if ('min_change_h6_pct' in conditions) {
+    if (chH6 == null || Number(chH6) < conditions.min_change_h6_pct) return false;
+  }
+  if ('min_change_h24_pct' in conditions) {
+    if (chH24 == null || Number(chH24) < conditions.min_change_h24_pct) return false;
+  }
+
+  return true;
+}
+
+function renderTemplate_(letter, ticker, cfg) {
+  if (!cfg) return '';
+  var t = (cfg.templates || {})[letter];
+  if (!t) return '';
+  var defaultName = ((cfg.placeholders || {}).default_team_or_name) || 'Team';
+  var body = String(t.body || '');
+  body = body.split('$TEAM_OR_NAME').join(defaultName);
+  body = body.split('$TICKER').join(ticker || '');
+  return body;
+}
+
+function extractTicker_(project) {
+  var s = normalize_(project);
+  if (!s) return '';
+  var m = s.match(/^([^\s(]+)/);
+  return m ? m[1] : '';
+}
+
+function redecideTemplateForRow_(ctx, row, log) {
+  var cfg = fetchTemplatesConfig_();
+  if (!cfg) return;
+
+  var volAtIngest = Number(row[idx_(COL.VOL_AT_INGEST)]) || 0;
+  if (!volAtIngest && Number(ctx.volume24h) > 0) {
+    volAtIngest = Number(ctx.volume24h);
+    row[idx_(COL.VOL_AT_INGEST)] = volAtIngest;
+  }
+
+  var currentPrice = Number((ctx.dsResult && ctx.dsResult.price) || 0);
+  var priceMaxSeen = Number(row[idx_(COL.PRICE_MAX_SEEN)]) || 0;
+  if (currentPrice > 0 && currentPrice > priceMaxSeen) {
+    priceMaxSeen = currentPrice;
+    row[idx_(COL.PRICE_MAX_SEEN)] = priceMaxSeen;
+  }
+
+  var ageRaw = ctx.age;
+  var ageDays = null;
+  if (typeof ageRaw === 'number') ageDays = ageRaw;
+  else if (typeof ageRaw === 'string') {
+    var am = ageRaw.match(/^(\d+)/);
+    if (am) ageDays = parseInt(am[1], 10);
+  }
+
+  var td = {
+    age_days: ageDays,
+    market_cap: Number(ctx.mcap) || 0,
+    volume_24h: Number(ctx.volume24h) || 0,
+    vol_at_ingest: volAtIngest,
+    price: currentPrice,
+    price_max_seen: priceMaxSeen,
+    change_h1: ctx.dsResult ? ctx.dsResult.change_h1 : null,
+    change_h6: ctx.dsResult ? ctx.dsResult.change_h6 : null,
+    change_h24: (ctx.change24h === '' || ctx.change24h == null) ? null : Number(ctx.change24h)
+  };
+
+  var decision = evaluateTemplateRules_(td, cfg);
+  var templateCell = decision.template + (decision.flag ? ' [' + decision.flag + ']' : '');
+  row[idx_(COL.TEMPLATE)] = templateCell;
+
+  var existingOutreach = normalize_(row[idx_(COL.OUTREACH_TEMPLATE)]);
+  if (!existingOutreach) {
+    var ticker = extractTicker_(ctx.project);
+    var rendered = renderTemplate_(decision.template, ticker, cfg);
+    if (rendered) row[idx_(COL.OUTREACH_TEMPLATE)] = rendered;
+  }
+
+  if (log) {
+    log.push('  [TPL] ' + templateCell +
+             ' | age=' + (ageDays == null ? 'n/a' : ageDays + 'd') +
+             ' mcap=' + Math.round(td.market_cap) +
+             ' vol=' + Math.round(td.volume_24h) +
+             ' volIngest=' + Math.round(td.vol_at_ingest) +
+             ' price=' + td.price +
+             ' priceMax=' + td.price_max_seen);
+  }
+}
+
+function redecideAllTemplates() {
+  var sheet = getTargetSheet_();
+  if (!sheet) return;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.DATA_START_ROW) {
+    SpreadsheetApp.getUi().alert('No data rows.');
+    return;
+  }
+  var cfg = fetchTemplatesConfig_();
+  if (!cfg) {
+    SpreadsheetApp.getUi().alert('Could not fetch templates. Aborting.');
+    return;
+  }
+
+  var numRows = lastRow - CONFIG.DATA_START_ROW + 1;
+  var numCols = Math.max(sheet.getLastColumn(), COL.ROW_WIDTH);
+  var values = sheet.getRange(CONFIG.DATA_START_ROW, 1, numRows, numCols).getValues();
+
+  var changed = 0;
+  for (var r = 0; r < values.length; r++) {
+    var row = values[r];
+    if (!normalize_(row[idx_(COL.ADDRESS)])) continue;
+
+    var ageRaw = row[idx_(COL.AGE)];
+    var ageDays = null;
+    if (typeof ageRaw === 'number') ageDays = ageRaw;
+    else if (typeof ageRaw === 'string') {
+      var m = ageRaw.match(/^(\d+)/);
+      if (m) ageDays = parseInt(m[1], 10);
+    }
+
+    var td = {
+      age_days: ageDays,
+      market_cap: Number(row[idx_(COL.MCAP)]) || 0,
+      volume_24h: Number(row[idx_(COL.VOLUME_24H)]) || 0,
+      vol_at_ingest: Number(row[idx_(COL.VOL_AT_INGEST)]) || 0,
+      price: 0,
+      price_max_seen: Number(row[idx_(COL.PRICE_MAX_SEEN)]) || 0,
+      change_h1: null,
+      change_h6: null,
+      change_h24: (row[idx_(COL.CHANGE_24H)] === '' || row[idx_(COL.CHANGE_24H)] == null) ? null : Number(row[idx_(COL.CHANGE_24H)])
+    };
+
+    var decision = evaluateTemplateRules_(td, cfg);
+    var newVal = decision.template + (decision.flag ? ' [' + decision.flag + ']' : '');
+    var oldVal = normalize_(row[idx_(COL.TEMPLATE)]);
+    if (newVal !== oldVal) {
+      row[idx_(COL.TEMPLATE)] = newVal;
+      changed++;
+    }
+
+    if (!normalize_(row[idx_(COL.OUTREACH_TEMPLATE)])) {
+      var ticker = extractTicker_(row[idx_(COL.PROJECT)]);
+      var rendered = renderTemplate_(decision.template, ticker, cfg);
+      if (rendered) row[idx_(COL.OUTREACH_TEMPLATE)] = rendered;
+    }
+  }
+
+  sheet.getRange(CONFIG.DATA_START_ROW, 1, numRows, numCols).setValues(values);
+  SpreadsheetApp.getUi().alert('Re-decided templates for ' + numRows + ' rows. ' + changed + ' changed.');
+}
+
+function setupTemplateColumns() {
+  var sheet = getTargetSheet_();
+  if (!sheet) return;
+  var headers = [
+    [COL.VOL_AT_INGEST, 'Vol at Ingest'],
+    [COL.PRICE_MAX_SEEN, 'Price Max Seen'],
+    [COL.TEMPLATE, 'Template']
+  ];
+  for (var i = 0; i < headers.length; i++) {
+    var col = headers[i][0];
+    var label = headers[i][1];
+    var cell = sheet.getRange(CONFIG.HEADER_ROW, col);
+    if (!normalize_(cell.getValue())) cell.setValue(label);
+  }
+  SpreadsheetApp.getUi().alert('Template columns (V/W/X) ready.');
 }
