@@ -1,13 +1,9 @@
 name: dexscreener-tracker
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
+  # Cron disabled pending column-collision fix (V/W conflict with Message Sent/Received).
+  # Re-enable by restoring the schedule block.
   workflow_dispatch:
-  push:
-    paths:
-      - 'dexscreener-tracker/**'
-      - '.github/workflows/tracker.yml'
 
 permissions:
   contents: write
