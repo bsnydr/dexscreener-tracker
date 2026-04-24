@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "updated": "2026-04-24",
+  "templates": {
+    "A": {
+      "label": "Volume revival",
+      "description": "Older project, volume has picked up recently",
+      "body": "Hey $TEAM_OR_NAME, quick question.\nSaw $$TICKER pushing good volume lately.\nAre you guys handling volume and building your treasury manually, or working with a market maker?"
+    },
+    "B": {
+      "label": "Held the floor",
+      "description": "Newer project that dumped from ATH but hasn't been rugged, still above 70k mcap",
+      "body": "Hey $TEAM_OR_NAME, $$TICKER has been holding its floor better than most projects its size right now.\nYou guys running that in-house or have a MM behind it?"
+    },
+    "C": {
+      "label": "Up only",
+      "description": "New chart, mostly up only, no significant dumps",
+      "body": "Hey $TEAM_OR_NAME, $$TICKER chart looks clean, not a lot of dumps for a project at this stage.\nAre you guys managing that yourselves or working with a MM?"
+    }
+  },
+  "rules": [
+    {
+      "template": "A",
+      "label": "older + volume revival",
+      "conditions": {
+        "min_age_days": 30,
+        "min_vol_ratio_vs_ingest": 2.0
+      }
+    },
+    {
+      "template": "B",
+      "label": "held the floor after ATH dump",
+      "conditions": {
+        "min_market_cap": 70000,
+        "min_drawdown_from_max_pct": 50,
+        "min_change_h6_pct": -10,
+        "min_change_h1_pct": -5
+      }
+    },
+    {
+      "template": "C",
+      "label": "new + up only",
+      "conditions": {
+        "max_age_days": 30,
+        "min_market_cap": 70000,
+        "min_change_h24_pct": 0
+      }
+    }
+  ],
+  "fallback": {
+    "template": "A",
+    "flag": "FALLBACK_NO_MATCH"
+  },
+  "placeholders": {
+    "default_team_or_name": "Team"
+  }
+}
